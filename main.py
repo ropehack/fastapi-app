@@ -17,53 +17,54 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# 一覧（10件ずつ）
+# ■ 一覧（検索 + ページング）
 @app.get("/companies")
-def get_companies(limit: int = 10, offset: int = 0):
+def get_companies(area: str = "", keyword: str = "", limit: int = 10, offset: int = 0):
 
-    res = supabase.table("companies") \
-        .select("*") \
-        .range(offset, offset + limit - 1) \
-        .execute()
+    query = supabase.table("companies").select("*")
+
+    if area:
+        query = query.eq("area", area)
+
+    if keyword:
+        query = query.ilike("name", f"%{keyword}%")
+
+    res = query.range(offset, offset + limit - 1).execute()
 
     return res.data
 
 
-# 追加（重複防止あり）
-@app.get("/search")
-def search(area: str = "", keyword: str = ""):
+# ■ 追加（重複防止）
+@app.post("/company")
+def create_company(data: dict):
 
     exists = supabase.table("companies") \
         .select("id") \
-        .eq("name", keyword) \
-        .eq("area", area) \
+        .eq("name", data.get("name")) \
+        .eq("area", data.get("area")) \
         .execute()
 
     if len(exists.data) == 0:
         supabase.table("companies").insert({
-            "name": keyword,
-            "area": area,
-            "email": "",
-            "phone": "",
-            "url": "",
+            "name": data.get("name"),
+            "area": data.get("area"),
+            "email": data.get("email", ""),
+            "phone": data.get("phone", ""),
+            "url": data.get("url", ""),
             "status": "未対応"
         }).execute()
 
     return {"ok": True}
 
 
-# 削除（完全版）
+# ■ 削除（完全版）
 @app.delete("/company/{id}")
 def delete_company(id: int):
-    supabase.table("companies") \
-        .delete() \
-        .eq("id", id) \
-        .execute()
-
+    supabase.table("companies").delete().eq("id", id).execute()
     return {"ok": True}
 
 
-# ステータス切替
+# ■ ステータス変更
 @app.post("/status/{id}")
 def update_status(id: int):
 
@@ -87,4 +88,4 @@ def update_status(id: int):
         "status": next_status
     }).eq("id", id).execute()
 
-    return {"ok": True, "status": next_status}
+    return {"ok": True}
