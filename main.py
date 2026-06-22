@@ -17,31 +17,53 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# 一覧取得
+# 一覧（10件ずつ）
 @app.get("/companies")
-def get_companies():
-    return supabase.table("companies").select("*").execute().data
+def get_companies(limit: int = 10, offset: int = 0):
 
-# 追加
+    res = supabase.table("companies") \
+        .select("*") \
+        .range(offset, offset + limit - 1) \
+        .execute()
+
+    return res.data
+
+
+# 追加（重複防止あり）
 @app.get("/search")
 def search(area: str = "", keyword: str = ""):
-    supabase.table("companies").insert({
-        "name": keyword,
-        "area": area,
-        "email": "",
-        "phone": "",
-        "url": "",
-        "status": "未対応"
-    }).execute()
+
+    exists = supabase.table("companies") \
+        .select("id") \
+        .eq("name", keyword) \
+        .eq("area", area) \
+        .execute()
+
+    if len(exists.data) == 0:
+        supabase.table("companies").insert({
+            "name": keyword,
+            "area": area,
+            "email": "",
+            "phone": "",
+            "url": "",
+            "status": "未対応"
+        }).execute()
+
     return {"ok": True}
 
-# 削除
+
+# 削除（完全版）
 @app.delete("/company/{id}")
 def delete_company(id: int):
-    supabase.table("companies").delete().eq("id", id).execute()
+    supabase.table("companies") \
+        .delete() \
+        .eq("id", id) \
+        .execute()
+
     return {"ok": True}
 
-# ステータス変更（クリックで循環）
+
+# ステータス切替
 @app.post("/status/{id}")
 def update_status(id: int):
 
