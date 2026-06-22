@@ -5,19 +5,22 @@ from supabase import create_client
 
 app = FastAPI()
 
+# ■ CORS（本番用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://ropehack.jp"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ■ Supabase接続
 supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
 
-# ■ 一覧 + 検索 + ページング
+# ■ 一覧（検索 + ページング）
 @app.get("/companies")
 def get_companies(area: str = "", keyword: str = "", limit: int = 10, offset: int = 0):
 
@@ -30,17 +33,16 @@ def get_companies(area: str = "", keyword: str = "", limit: int = 10, offset: in
         query = query.ilike("name", f"%{keyword}%")
 
     res = query.range(offset, offset + limit - 1).execute()
-
     return res.data
 
 
-# ■ 追加（重複はDBで防ぐ）
+# ■ 追加
 @app.post("/company")
-def create_company(data: dict):
+def add_company(data: dict):
 
     supabase.table("companies").insert({
-        "name": data["name"],
-        "area": data["area"],
+        "name": data.get("name", ""),
+        "area": data.get("area", ""),
         "email": data.get("email", ""),
         "phone": data.get("phone", ""),
         "url": data.get("url", ""),
@@ -57,9 +59,9 @@ def delete_company(id: int):
     return {"ok": True}
 
 
-# ■ ステータス変更
+# ■ ステータス切替
 @app.post("/status/{id}")
-def update_status(id: int):
+def change_status(id: int):
 
     res = supabase.table("companies") \
         .select("status") \
@@ -71,7 +73,7 @@ def update_status(id: int):
 
     flow = ["未対応", "連絡済み", "商談中", "成約"]
 
-    next_status = flow[(flow.index(current)+1) % len(flow)] if current in flow else "未対応"
+    next_status = flow[(flow.index(current) + 1) % len(flow)] if current in flow else "未対応"
 
     supabase.table("companies").update({
         "status": next_status
