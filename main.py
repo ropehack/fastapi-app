@@ -17,7 +17,7 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# ■ 一覧（検索 + ページング）
+# ■ 一覧 + 検索 + ページング
 @app.get("/companies")
 def get_companies(area: str = "", keyword: str = "", limit: int = 10, offset: int = 0):
 
@@ -34,30 +34,23 @@ def get_companies(area: str = "", keyword: str = "", limit: int = 10, offset: in
     return res.data
 
 
-# ■ 追加（重複防止）
+# ■ 追加（重複はDBで防ぐ）
 @app.post("/company")
 def create_company(data: dict):
 
-    exists = supabase.table("companies") \
-        .select("id") \
-        .eq("name", data.get("name")) \
-        .eq("area", data.get("area")) \
-        .execute()
-
-    if len(exists.data) == 0:
-        supabase.table("companies").insert({
-            "name": data.get("name"),
-            "area": data.get("area"),
-            "email": data.get("email", ""),
-            "phone": data.get("phone", ""),
-            "url": data.get("url", ""),
-            "status": "未対応"
-        }).execute()
+    supabase.table("companies").insert({
+        "name": data["name"],
+        "area": data["area"],
+        "email": data.get("email", ""),
+        "phone": data.get("phone", ""),
+        "url": data.get("url", ""),
+        "status": "未対応"
+    }).execute()
 
     return {"ok": True}
 
 
-# ■ 削除（完全版）
+# ■ 削除
 @app.delete("/company/{id}")
 def delete_company(id: int):
     supabase.table("companies").delete().eq("id", id).execute()
@@ -78,11 +71,7 @@ def update_status(id: int):
 
     flow = ["未対応", "連絡済み", "商談中", "成約"]
 
-    if current not in flow:
-        next_status = "未対応"
-    else:
-        idx = flow.index(current)
-        next_status = flow[(idx + 1) % len(flow)]
+    next_status = flow[(flow.index(current)+1) % len(flow)] if current in flow else "未対応"
 
     supabase.table("companies").update({
         "status": next_status
