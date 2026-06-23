@@ -1,12 +1,21 @@
 import os
 import logging
 import httpx
-from datetime import date
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import Optional, List
+
+# ============================================================
+# タイムゾーン：JST固定（RenderサーバーはUTC）
+# ============================================================
+JST = timezone(timedelta(hours=9))
+
+def today_jst() -> str:
+    """日本時間の今日の日付を YYYY-MM-DD 文字列で返す"""
+    return datetime.now(JST).strftime("%Y-%m-%d")
 
 # ============================================================
 # ログ設定
@@ -89,7 +98,7 @@ class PlacesSearchResponse(BaseModel):
 # ユーティリティ：今日の取得済み件数
 # ============================================================
 def get_today_count() -> int:
-    today = date.today().isoformat()
+    today = today_jst()
     try:
         res = supabase.table("daily_search_log") \
             .select("count") \
@@ -103,7 +112,7 @@ def get_today_count() -> int:
         return 0
 
 def increment_today_count(amount: int) -> int:
-    today = date.today().isoformat()
+    today = today_jst()
     try:
         existing = supabase.table("daily_search_log") \
             .select("count") \
@@ -205,7 +214,7 @@ def daily_status():
     count = get_today_count()
     logger.info(f"daily-status: used={count}, remaining={max(0, DAILY_LIMIT - count)}")
     return {
-        "date": date.today().isoformat(),
+        "date": today_jst(),
         "used": count,
         "remaining": max(0, DAILY_LIMIT - count),
         "limit": DAILY_LIMIT,
