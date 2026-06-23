@@ -14,7 +14,7 @@ from typing import Optional, List
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="営業リスト管理API", version="2.2.0")
+app = FastAPI(title="営業リスト管理API", version="2.3.0")
 
 # ============================================================
 # CORS設定
@@ -47,7 +47,6 @@ logger.info(f"Supabase接続完了: {SUPABASE_URL}")
 # ============================================================
 # 定数
 # ============================================================
-# ★フロントと完全一致させる（app.js の STATUS_OPTIONS と同じ）
 STATUS_FLOW = ["未送信", "送信済み", "商談中"]
 DAILY_LIMIT = 30
 
@@ -137,38 +136,44 @@ def is_already_saved(place_id: str) -> bool:
         return False
 
 # ============================================================
-# ★問題1修正: 削除後にIDを1,2,3,4...と振り直すヘルパー
+# IDを1から振り直すヘルパー（修正版）
 # ============================================================
 def resequence_ids() -> int:
     """
-    companiesテーブルの全レコードを created_at 昇順で取得し、
+    companiesテーブルの全レコードをid昇順で取得し、
     id を 1 から連番で振り直す。
-    PostgreSQL の SEQUENCE も同期させる。
-    戻り値: 振り直し後の総件数
+    シーケンスはSQL経由で直接リセット。
     """
     try:
-        # 全件を登録順(id昇順)で取得
+        # 全件をid昇順で取得
         res = supabase.table("companies").select("id").order("id", desc=False).execute()
         rows = res.data or []
 
-        # 1件ずつ新しいidに更新
-        # 重複を避けるため、まず全件を負のidに退避してから振り直す
+        if not rows:
+            return 0
+
+        # まず全件を大きい値に退避（衝突防止）
         for row in rows:
             supabase.table("companies") \
-                .update({"id": -row["id"]}) \
+                .update({"id": row["id"] + 100000}) \
                 .eq("id", row["id"]) \
                 .execute()
 
+        # 1から振り直す
         for new_id, row in enumerate(rows, start=1):
             supabase.table("companies") \
                 .update({"id": new_id}) \
-                .eq("id", -row["id"]) \
+                .eq("id", row["id"] + 100000) \
                 .execute()
 
-        # Supabaseのシーケンスを最大idに合わせる（次のINSERTがid重複しないよう）
         max_id = len(rows)
-        if max_id > 0:
+
+        # シーケンスリセット（RPCが存在すれば使う、なければスキップ）
+        try:
             supabase.rpc("setval_companies_id_seq", {"new_val": max_id}).execute()
+            logger.info(f"シーケンスリセット完了: {max_id}")
+        except Exception as rpc_err:
+            logger.warning(f"シーケンスRPCスキップ（SQL Editorで手動実行してください）: {rpc_err}")
 
         logger.info(f"ID振り直し完了: {max_id}件")
         return max_id
@@ -191,6 +196,20 @@ def health():
     except Exception as e:
         logger.error(f"DB接続エラー: {e}")
         raise HTTPException(status_code=503, detail=f"DB接続失敗: {str(e)}")
+
+# ============================================================
+# daily-status デバッグ用エンドポイント追加
+# ============================================================
+@app.get("/places/daily-status")
+def daily_status():
+    count = get_today_count()
+    logger.info(f"daily-status: used={count}, remaining={max(0, DAILY_LIMIT - count)}")
+    return {
+        "date": date.today().isoformat(),
+        "used": count,
+        "remaining": max(0, DAILY_LIMIT - count),
+        "limit": DAILY_LIMIT,
+    }
 
 # ============================================================
 # Places API 検索
@@ -309,7 +328,6 @@ def save_places(req: SavePlacesRequest):
             "email": "",
             "phone": item.get("phone", "").strip(),
             "url": item.get("url", "").strip(),
-            # ★フロントの STATUS_OPTIONS と合わせて "未送信" に統一
             "status": "未送信",
             "place_id": place_id,
         }
@@ -330,7 +348,7 @@ def save_places(req: SavePlacesRequest):
     else:
         today_new = today_count
 
-    logger.info(f"保存完了: {len(saved)}件 / 重複: {len(skipped_dup)}件 / 上限超過: {len(skipped_limit)}件")
+    logger.info(f"保存完了: {len(saved)}件 / 重複: {len(skipped_dup)}件 / 上限超過: {len(skipped_limit)}件 / 本日合計: {today_new}")
 
     return {
         "ok": True,
@@ -340,19 +358,6 @@ def save_places(req: SavePlacesRequest):
         "today_total": today_new,
         "today_remaining": max(0, DAILY_LIMIT - today_new),
         "data": saved,
-    }
-
-# ============================================================
-# 今日の取得状況
-# ============================================================
-@app.get("/places/daily-status")
-def daily_status():
-    count = get_today_count()
-    return {
-        "date": date.today().isoformat(),
-        "used": count,
-        "remaining": max(0, DAILY_LIMIT - count),
-        "limit": DAILY_LIMIT,
     }
 
 # ============================================================
@@ -391,7 +396,7 @@ def get_companies(
             query = query.or_(f"name.ilike.%{keyword}%,email.ilike.%{keyword}%,phone.ilike.%{keyword}%")
         if status:
             query = query.eq("status", status)
-        # ★id昇順(小さい番号が先頭)で返す。振り直し後もidと表示番号が一致する。
+        # id昇順（小さい番号＝古い順が先頭）
         query = query.order("id", desc=False)
         res = query.range(offset, offset + limit - 1).execute()
         return {"data": res.data, "total": res.count, "limit": limit, "offset": offset}
@@ -448,7 +453,7 @@ def update_company(id: int, data: CompanyUpdate):
         raise HTTPException(status_code=500, detail=f"更新失敗: {str(e)}")
 
 # ============================================================
-# ★問題1修正: 削除 → ID振り直し → 一覧を返す
+# 削除 → ID振り直し
 # ============================================================
 @app.delete("/company/{id}")
 def delete_company(id: int):
@@ -460,9 +465,7 @@ def delete_company(id: int):
         supabase.table("companies").delete().eq("id", id).execute()
         logger.info(f"DELETE成功: id={id}")
 
-        # ★削除後にIDを詰めて振り直す
         new_total = resequence_ids()
-
         return {"ok": True, "deleted_id": id, "new_total": new_total}
 
     except HTTPException:
