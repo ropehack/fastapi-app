@@ -1,18 +1,20 @@
 import os
 import logging
+import httpx
+from datetime import date
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from pydantic import BaseModel
+from typing import Optional, List
 
 # ============================================================
-# ログ設定（Renderのログで問題を追いやすくする）
+# ログ設定
 # ============================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="営業リスト管理API", version="1.0.0")
+app = FastAPI(title="営業リスト管理API", version="2.0.0")
 
 # ============================================================
 # CORS設定
@@ -21,7 +23,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://ropehack.jp",
-        "http://localhost:3000",   # ローカル開発用
+        "http://localhost:3000",
         "http://localhost:8080",
     ],
     allow_credentials=True,
@@ -30,10 +32,11 @@ app.add_middleware(
 )
 
 # ============================================================
-# Supabase接続
+# 環境変数
 # ============================================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL または SUPABASE_KEY が設定されていません")
@@ -42,12 +45,17 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 logger.info(f"Supabase接続完了: {SUPABASE_URL}")
 
 # ============================================================
-# ステータスフロー定義
+# 定数
 # ============================================================
 STATUS_FLOW = ["未対応", "連絡済み", "商談中", "成約"]
+DAILY_LIMIT = 30
+
+# Places API (New) エンドポイント
+PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+PLACES_DETAIL_URL = "https://places.googleapis.com/v1/places/{place_id}"
 
 # ============================================================
-# Pydanticモデル（型安全 + バリデーション）
+# Pydanticモデル
 # ============================================================
 class CompanyCreate(BaseModel):
     name: str
@@ -64,6 +72,68 @@ class CompanyUpdate(BaseModel):
     url: Optional[str] = None
     status: Optional[str] = None
 
+class PlacesSearchResult(BaseModel):
+    place_id: str
+    name: str
+    area: str
+    phone: str
+    url: str
+    already_saved: bool  # 既にDBに存在するか
+
+# ============================================================
+# ユーティリティ：今日の取得済み件数を返す
+# ============================================================
+def get_today_count() -> int:
+    today = date.today().isoformat()
+    try:
+        res = supabase.table("daily_search_log") \
+            .select("count") \
+            .eq("search_date", today) \
+            .execute()
+        if res.data:
+            return res.data[0]["count"]
+        return 0
+    except Exception as e:
+        logger.error(f"daily_search_log 取得エラー: {e}")
+        return 0
+
+# ============================================================
+# ユーティリティ：今日のカウントを加算する
+# ============================================================
+def increment_today_count(amount: int):
+    today = date.today().isoformat()
+    try:
+        existing = supabase.table("daily_search_log") \
+            .select("count") \
+            .eq("search_date", today) \
+            .execute()
+
+        if existing.data:
+            new_count = existing.data[0]["count"] + amount
+            supabase.table("daily_search_log") \
+                .update({"count": new_count}) \
+                .eq("search_date", today) \
+                .execute()
+        else:
+            supabase.table("daily_search_log") \
+                .insert({"search_date": today, "count": amount}) \
+                .execute()
+    except Exception as e:
+        logger.error(f"daily_search_log 更新エラー: {e}")
+
+# ============================================================
+# ユーティリティ：place_id が既にDBにあるか確認
+# ============================================================
+def is_already_saved(place_id: str) -> bool:
+    try:
+        res = supabase.table("companies") \
+            .select("id") \
+            .eq("place_id", place_id) \
+            .execute()
+        return len(res.data) > 0
+    except Exception:
+        return False
+
 # ============================================================
 # ヘルスチェック
 # ============================================================
@@ -73,7 +143,6 @@ def health_check():
 
 @app.get("/health")
 def health():
-    """DB接続確認用エンドポイント"""
     try:
         res = supabase.table("companies").select("id").limit(1).execute()
         return {"status": "ok", "db": "connected", "sample_count": len(res.data)}
@@ -82,8 +151,218 @@ def health():
         raise HTTPException(status_code=503, detail=f"DB接続失敗: {str(e)}")
 
 # ============================================================
-# 一覧・検索（SELECT）
+# Places API 検索（エリア×キーワード）
 # ============================================================
+@app.get("/places/search", response_model=List[PlacesSearchResult])
+async def search_places(
+    area: str = Query(..., description="エリア（例：横浜）"),
+    keyword: str = Query(..., description="キーワード（例：管理会社）"),
+    max_results: int = Query(default=10, ge=1, le=20, description="1回の取得件数（最大20）"),
+):
+    """
+    Google Places API (New) でエリア×キーワード検索を行い、
+    会社情報のプレビューリストを返す。
+    （この時点ではDBには保存しない）
+    """
+    if not GOOGLE_PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_PLACES_API_KEY が設定されていません")
+
+    # 1日の上限チェック
+    today_count = get_today_count()
+    if today_count >= DAILY_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"本日の取得上限（{DAILY_LIMIT}件）に達しました。明日また試してください。"
+        )
+
+    # 残り取得可能件数を考慮して max_results を制限
+    remaining = DAILY_LIMIT - today_count
+    actual_max = min(max_results, remaining)
+
+    query_text = f"{area} {keyword}"
+    logger.info(f"Places検索: '{query_text}' (最大{actual_max}件, 今日{today_count}/{DAILY_LIMIT}件済み)")
+
+    # Places API (New) テキスト検索リクエスト
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": (
+            "places.id,"
+            "places.displayName,"
+            "places.formattedAddress,"
+            "places.nationalPhoneNumber,"
+            "places.websiteUri,"
+            "places.regularOpeningHours"
+        ),
+    }
+    body = {
+        "textQuery": query_text,
+        "maxResultCount": actual_max,
+        "languageCode": "ja",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(PLACES_SEARCH_URL, json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Places API HTTPエラー: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=502, detail=f"Places API エラー: {e.response.status_code}")
+    except Exception as e:
+        logger.error(f"Places API 通信エラー: {e}")
+        raise HTTPException(status_code=502, detail=f"Places API 通信失敗: {str(e)}")
+
+    places = data.get("places", [])
+    results: List[PlacesSearchResult] = []
+
+    for p in places:
+        place_id = p.get("id", "")
+        name = p.get("displayName", {}).get("text", "")
+        address = p.get("formattedAddress", "")
+        phone = p.get("nationalPhoneNumber", "")
+        website = p.get("websiteUri", "")
+
+        # エリア抽出（住所から都道府県＋市区町村を取得）
+        area_extracted = _extract_area(address, area)
+
+        already = is_already_saved(place_id)
+
+        results.append(PlacesSearchResult(
+            place_id=place_id,
+            name=name,
+            area=area_extracted,
+            phone=phone,
+            url=website,
+            already_saved=already,
+        ))
+
+    logger.info(f"Places検索結果: {len(results)}件取得")
+    return results
+
+
+# ============================================================
+# Places 検索結果を選択してDBに保存
+# ============================================================
+class SavePlacesRequest(BaseModel):
+    places: List[dict]  # PlacesSearchResult の辞書リスト
+
+@app.post("/places/save", status_code=201)
+def save_places(req: SavePlacesRequest):
+    """
+    /places/search で取得した結果のうち、選択した会社をDBに一括保存する。
+    ・重複（place_id が既存）はスキップ
+    ・1日30件の上限を超える分はスキップ
+    """
+    today_count = get_today_count()
+    remaining = DAILY_LIMIT - today_count
+
+    if remaining <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"本日の取得上限（{DAILY_LIMIT}件）に達しました。"
+        )
+
+    saved = []
+    skipped_dup = []
+    skipped_limit = []
+
+    for item in req.places:
+        if len(saved) >= remaining:
+            skipped_limit.append(item.get("name", ""))
+            continue
+
+        place_id = item.get("place_id", "")
+
+        # 重複チェック
+        if place_id and is_already_saved(place_id):
+            skipped_dup.append(item.get("name", ""))
+            continue
+
+        payload = {
+            "name": item.get("name", "").strip(),
+            "area": item.get("area", "").strip(),
+            "email": "",   # Places API はメールを返さないため空
+            "phone": item.get("phone", "").strip(),
+            "url": item.get("url", "").strip(),
+            "status": "未対応",
+            "place_id": place_id,
+        }
+
+        if not payload["name"]:
+            continue
+
+        try:
+            res = supabase.table("companies").insert(payload).execute()
+            if res.data:
+                saved.append(res.data[0])
+        except Exception as e:
+            logger.error(f"INSERT エラー ({payload['name']}): {e}")
+            skipped_dup.append(payload["name"])
+
+    # カウント更新
+    if saved:
+        increment_today_count(len(saved))
+
+    today_new = get_today_count()
+    logger.info(f"保存完了: {len(saved)}件 / 重複スキップ: {len(skipped_dup)}件 / 上限スキップ: {len(skipped_limit)}件")
+
+    return {
+        "ok": True,
+        "saved_count": len(saved),
+        "skipped_duplicate": skipped_dup,
+        "skipped_limit": skipped_limit,
+        "today_total": today_new,
+        "today_remaining": max(0, DAILY_LIMIT - today_new),
+        "data": saved,
+    }
+
+
+# ============================================================
+# 今日の取得状況を確認
+# ============================================================
+@app.get("/places/daily-status")
+def daily_status():
+    count = get_today_count()
+    return {
+        "date": date.today().isoformat(),
+        "used": count,
+        "remaining": max(0, DAILY_LIMIT - count),
+        "limit": DAILY_LIMIT,
+    }
+
+
+# ============================================================
+# エリア抽出ヘルパー
+# ============================================================
+def _extract_area(address: str, fallback: str) -> str:
+    """
+    住所文字列から都道府県＋市区町村を抽出する。
+    例: "〒220-0011 神奈川県横浜市西区高島２丁目..." → "神奈川県横浜市"
+    """
+    import re
+    # 都道府県パターン
+    pref_pattern = r'(北海道|(?:東京|大阪|京都)府|.{2,3}県)'
+    # 市区町村パターン
+    city_pattern = r'(?:札幌市|(?:.+?)[市区町村])'
+
+    pref_match = re.search(pref_pattern, address)
+    if not pref_match:
+        return fallback
+
+    pref = pref_match.group(1)
+    rest = address[pref_match.end():]
+    city_match = re.match(city_pattern, rest)
+
+    if city_match:
+        return pref + city_match.group(0)
+    return pref
+
+
+# ============================================================
+# 以下、既存のエンドポイント（変更なし）
+# ============================================================
+
 @app.get("/companies")
 def get_companies(
     area: str = Query(default="", description="エリアでフィルタ"),
@@ -99,8 +378,6 @@ def get_companies(
             query = query.eq("area", area)
 
         if keyword:
-            # 部分一致：name OR email OR phone を横断検索
-            # Supabaseでのor検索
             query = query.or_(
                 f"name.ilike.%{keyword}%,"
                 f"email.ilike.%{keyword}%,"
@@ -110,10 +387,7 @@ def get_companies(
         if status:
             query = query.eq("status", status)
 
-        # 新しい順に並べる
         query = query.order("id", desc=True)
-
-        # ページング
         res = query.range(offset, offset + limit - 1).execute()
 
         logger.info(f"検索結果: {len(res.data)}件 (area={area}, keyword={keyword}, status={status})")
@@ -130,9 +404,6 @@ def get_companies(
         raise HTTPException(status_code=500, detail=f"データ取得失敗: {str(e)}")
 
 
-# ============================================================
-# 1件取得
-# ============================================================
 @app.get("/company/{id}")
 def get_company(id: int):
     try:
@@ -147,9 +418,6 @@ def get_company(id: int):
         raise HTTPException(status_code=500, detail=f"データ取得失敗: {str(e)}")
 
 
-# ============================================================
-# 追加（INSERT）
-# ============================================================
 @app.post("/company", status_code=201)
 def add_company(data: CompanyCreate):
     try:
@@ -160,6 +428,7 @@ def add_company(data: CompanyCreate):
             "phone": data.phone.strip() if data.phone else "",
             "url": data.url.strip() if data.url else "",
             "status": "未対応",
+            "place_id": "",
         }
 
         if not payload["name"]:
@@ -176,13 +445,9 @@ def add_company(data: CompanyCreate):
         raise HTTPException(status_code=500, detail=f"追加失敗: {str(e)}")
 
 
-# ============================================================
-# 更新（UPDATE）
-# ============================================================
 @app.put("/company/{id}")
 def update_company(id: int, data: CompanyUpdate):
     try:
-        # Noneでないフィールドだけ更新
         payload = {k: v for k, v in data.model_dump().items() if v is not None}
         if not payload:
             raise HTTPException(status_code=422, detail="更新するフィールドがありません")
@@ -201,13 +466,9 @@ def update_company(id: int, data: CompanyUpdate):
         raise HTTPException(status_code=500, detail=f"更新失敗: {str(e)}")
 
 
-# ============================================================
-# 削除（DELETE）
-# ============================================================
 @app.delete("/company/{id}")
 def delete_company(id: int):
     try:
-        # 存在確認
         check = supabase.table("companies").select("id").eq("id", id).execute()
         if not check.data:
             raise HTTPException(status_code=404, detail="会社が見つかりません")
@@ -223,13 +484,9 @@ def delete_company(id: int):
         raise HTTPException(status_code=500, detail=f"削除失敗: {str(e)}")
 
 
-# ============================================================
-# ステータス変更（循環）
-# ============================================================
 @app.post("/status/{id}")
 def change_status(id: int):
     try:
-        # 現在のステータスを取得
         res = supabase.table("companies").select("status").eq("id", id).single().execute()
 
         if not res.data:
@@ -237,13 +494,11 @@ def change_status(id: int):
 
         current = res.data.get("status", "未対応")
 
-        # 次のステータスを計算
         if current in STATUS_FLOW:
             next_status = STATUS_FLOW[(STATUS_FLOW.index(current) + 1) % len(STATUS_FLOW)]
         else:
             next_status = "未対応"
 
-        # 更新
         supabase.table("companies").update({"status": next_status}).eq("id", id).execute()
         logger.info(f"STATUS変更: id={id}, {current} → {next_status}")
 
@@ -261,9 +516,6 @@ def change_status(id: int):
         raise HTTPException(status_code=500, detail=f"ステータス更新失敗: {str(e)}")
 
 
-# ============================================================
-# ステータスを直接指定して変更
-# ============================================================
 @app.post("/status/{id}/set")
 def set_status(id: int, status: str = Query(..., description="設定するステータス")):
     try:
