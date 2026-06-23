@@ -14,7 +14,7 @@ from typing import Optional, List
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="営業リスト管理API", version="2.0.0")
+app = FastAPI(title="営業リスト管理API", version="2.1.0")
 
 # ============================================================
 # CORS設定
@@ -50,6 +50,9 @@ logger.info(f"Supabase接続完了: {SUPABASE_URL}")
 STATUS_FLOW = ["未対応", "連絡済み", "商談中", "成約"]
 DAILY_LIMIT = 30
 
+# ★修正3: 対応エリアを関東地方のみに制限
+KANTO_PREFECTURES = ["東京都", "神奈川県", "埼玉県", "千葉県", "茨城県", "栃木県", "群馬県"]
+
 # Places API (New) エンドポイント
 PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACES_DETAIL_URL = "https://places.googleapis.com/v1/places/{place_id}"
@@ -80,6 +83,12 @@ class PlacesSearchResult(BaseModel):
     url: str
     already_saved: bool  # 既にDBに存在するか
 
+# ★修正1: ページネーション対応のため、検索結果は
+#          「中身のリスト」と「次ページ取得用トークン」をまとめて返す
+class PlacesSearchResponse(BaseModel):
+    places: List[PlacesSearchResult]
+    next_page_token: Optional[str] = None
+
 # ============================================================
 # ユーティリティ：今日の取得済み件数を返す
 # ============================================================
@@ -94,13 +103,19 @@ def get_today_count() -> int:
             return res.data[0]["count"]
         return 0
     except Exception as e:
+        # ★修正2: ここが0のまま動かない最大の原因になりやすい箇所。
+        #   daily_search_log テーブルが存在しない／RLSでブロックされていると
+        #   例外が握りつぶされて常に0を返してしまう。
+        #   schema.sql でテーブルを作成し、SUPABASE_KEYは
+        #   service_role キーを使うこと（anonキーだとRLSで弾かれる）。
         logger.error(f"daily_search_log 取得エラー: {e}")
         return 0
 
 # ============================================================
 # ユーティリティ：今日のカウントを加算する
 # ============================================================
-def increment_today_count(amount: int):
+def increment_today_count(amount: int) -> int:
+    """加算後の最新カウントを返す（フロントの即時反映に使う）"""
     today = date.today().isoformat()
     try:
         existing = supabase.table("daily_search_log") \
@@ -115,11 +130,14 @@ def increment_today_count(amount: int):
                 .eq("search_date", today) \
                 .execute()
         else:
+            new_count = amount
             supabase.table("daily_search_log") \
                 .insert({"search_date": today, "count": amount}) \
                 .execute()
+        return new_count
     except Exception as e:
         logger.error(f"daily_search_log 更新エラー: {e}")
+        return get_today_count()
 
 # ============================================================
 # ユーティリティ：place_id が既にDBにあるか確認
@@ -153,19 +171,33 @@ def health():
 # ============================================================
 # Places API 検索（エリア×キーワード）
 # ============================================================
-@app.get("/places/search", response_model=List[PlacesSearchResult])
+@app.get("/places/search", response_model=PlacesSearchResponse)
 async def search_places(
     area: str = Query(..., description="エリア（例：横浜）"),
     keyword: str = Query(..., description="キーワード（例：管理会社）"),
     max_results: int = Query(default=10, ge=1, le=20, description="1回の取得件数（最大20）"),
+    page_token: Optional[str] = Query(
+        default=None,
+        description="前回レスポンスの next_page_token。指定すると「次の" "件」を取得する",
+    ),
 ):
     """
     Google Places API (New) でエリア×キーワード検索を行い、
     会社情報のプレビューリストを返す。
     （この時点ではDBには保存しない）
+
+    page_token を渡すと、前回と同じ検索条件のまま「次のページ」の
+    結果を取得できる（＝同じ10件が返ってくる問題の対策）。
     """
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(status_code=500, detail="GOOGLE_PLACES_API_KEY が設定されていません")
+
+    # ★修正3: 関東地方以外は弾く（フロントのセレクトも絞るが、念のためバックエンドでも検証）
+    if not any(area.startswith(pref) for pref in KANTO_PREFECTURES):
+        raise HTTPException(
+            status_code=400,
+            detail="対応エリアは関東地方（東京都・神奈川県・埼玉県・千葉県・茨城県・栃木県・群馬県）のみです",
+        )
 
     # 1日の上限チェック
     today_count = get_today_count()
@@ -180,7 +212,10 @@ async def search_places(
     actual_max = min(max_results, remaining)
 
     query_text = f"{area} {keyword}"
-    logger.info(f"Places検索: '{query_text}' (最大{actual_max}件, 今日{today_count}/{DAILY_LIMIT}件済み)")
+    logger.info(
+        f"Places検索: '{query_text}' (最大{actual_max}件, "
+        f"page_token={'あり' if page_token else 'なし'}, 今日{today_count}/{DAILY_LIMIT}件済み)"
+    )
 
     # Places API (New) テキスト検索リクエスト
     headers = {
@@ -192,14 +227,21 @@ async def search_places(
             "places.formattedAddress,"
             "places.nationalPhoneNumber,"
             "places.websiteUri,"
-            "places.regularOpeningHours"
+            "places.regularOpeningHours,"
+            "nextPageToken"  # ★修正1: 次ページトークンも取得する
         ),
     }
+
+    # ★修正1: page_token がある場合は同じクエリ＋pageTokenで「次ページ」を取得。
+    #   Google側は textQuery を省略するとエラーになることがあるため、
+    #   pageToken と一緒に textQuery も送る（pageTokenが優先して使われる）。
     body = {
         "textQuery": query_text,
-        "maxResultCount": actual_max,
         "languageCode": "ja",
+        "pageSize": actual_max,
     }
+    if page_token:
+        body["pageToken"] = page_token
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -208,12 +250,19 @@ async def search_places(
             data = resp.json()
     except httpx.HTTPStatusError as e:
         logger.error(f"Places API HTTPエラー: {e.response.status_code} {e.response.text}")
+        # pageTokenが無効/期限切れの場合もここに来る。フロントには分かるメッセージを返す。
+        if page_token:
+            raise HTTPException(
+                status_code=502,
+                detail="次ページの取得に失敗しました。少し時間を置いてもう一度検索してください。",
+            )
         raise HTTPException(status_code=502, detail=f"Places API エラー: {e.response.status_code}")
     except Exception as e:
         logger.error(f"Places API 通信エラー: {e}")
         raise HTTPException(status_code=502, detail=f"Places API 通信失敗: {str(e)}")
 
     places = data.get("places", [])
+    next_token = data.get("nextPageToken")  # ★修正1: 無ければ None（=これ以上の結果なし）
     results: List[PlacesSearchResult] = []
 
     for p in places:
@@ -237,8 +286,8 @@ async def search_places(
             already_saved=already,
         ))
 
-    logger.info(f"Places検索結果: {len(results)}件取得")
-    return results
+    logger.info(f"Places検索結果: {len(results)}件取得 (next_page_token={'あり' if next_token else 'なし'})")
+    return PlacesSearchResponse(places=results, next_page_token=next_token)
 
 
 # ============================================================
@@ -300,11 +349,13 @@ def save_places(req: SavePlacesRequest):
             logger.error(f"INSERT エラー ({payload['name']}): {e}")
             skipped_dup.append(payload["name"])
 
-    # カウント更新
+    # ★修正2: 加算後の最新カウントをその場で受け取り、レスポンスに含める。
+    #   フロントはこの値をそのまま使えば、別途GETを叩いて競合（レース）する必要がない。
     if saved:
-        increment_today_count(len(saved))
+        today_new = increment_today_count(len(saved))
+    else:
+        today_new = today_count
 
-    today_new = get_today_count()
     logger.info(f"保存完了: {len(saved)}件 / 重複スキップ: {len(skipped_dup)}件 / 上限スキップ: {len(skipped_limit)}件")
 
     return {
