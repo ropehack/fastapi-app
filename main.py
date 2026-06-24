@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -7,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import Optional, List
+from bs4 import BeautifulSoup
 
 # ============================================================
 # タイムゾーン：JST固定（RenderサーバーはUTC）
@@ -23,7 +25,7 @@ def today_jst() -> str:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="営業リスト管理API", version="2.3.0")
+app = FastAPI(title="営業リスト管理API", version="2.4.0")
 
 # ============================================================
 # CORS設定
@@ -145,30 +147,22 @@ def is_already_saved(place_id: str) -> bool:
         return False
 
 # ============================================================
-# IDを1から振り直すヘルパー（修正版）
+# IDを1から振り直すヘルパー
 # ============================================================
 def resequence_ids() -> int:
-    """
-    companiesテーブルの全レコードをid昇順で取得し、
-    id を 1 から連番で振り直す。
-    シーケンスはSQL経由で直接リセット。
-    """
     try:
-        # 全件をid昇順で取得
         res = supabase.table("companies").select("id").order("id", desc=False).execute()
         rows = res.data or []
 
         if not rows:
             return 0
 
-        # まず全件を大きい値に退避（衝突防止）
         for row in rows:
             supabase.table("companies") \
                 .update({"id": row["id"] + 100000}) \
                 .eq("id", row["id"]) \
                 .execute()
 
-        # 1から振り直す
         for new_id, row in enumerate(rows, start=1):
             supabase.table("companies") \
                 .update({"id": new_id}) \
@@ -177,18 +171,105 @@ def resequence_ids() -> int:
 
         max_id = len(rows)
 
-        # シーケンスリセット（RPCが存在すれば使う、なければスキップ）
         try:
             supabase.rpc("setval_companies_id_seq", {"new_val": max_id}).execute()
             logger.info(f"シーケンスリセット完了: {max_id}")
         except Exception as rpc_err:
-            logger.warning(f"シーケンスRPCスキップ（SQL Editorで手動実行してください）: {rpc_err}")
+            logger.warning(f"シーケンスRPCスキップ: {rpc_err}")
 
         logger.info(f"ID振り直し完了: {max_id}件")
         return max_id
     except Exception as e:
         logger.error(f"ID振り直しエラー: {e}")
         raise
+
+# ============================================================
+# メール／フォームURL スクレイピング
+# ============================================================
+SCRAPE_TIMEOUT = 8.0
+SCRAPE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SalesBot/1.0)"}
+CONTACT_KEYWORDS = ["お問い合わせ", "問合せ", "問い合わせ", "contact", "Contact", "CONTACT", "inquiry", "Inquiry"]
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}")
+INVALID_EMAIL_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
+
+async def scrape_contact_from_url(url: str) -> str:
+    """
+    指定URLとコンタクトページ候補を巡回し、
+    メールアドレス → フォームURL の優先順で連絡先を返す。
+    何も取れなければ空文字を返す。
+    """
+    if not url:
+        return ""
+
+    base = url.rstrip("/")
+    # トップページ → コンタクト候補ページの順に試す
+    candidates = [url] + [
+        base + path
+        for path in ["/contact", "/contact-us", "/お問い合わせ", "/inquiry", "/form"]
+    ]
+
+    form_url_found = ""  # フォームURLの候補（メールが見つからない場合の代替）
+
+    async with httpx.AsyncClient(
+        timeout=SCRAPE_TIMEOUT,
+        follow_redirects=True,
+        headers=SCRAPE_HEADERS,
+    ) as client:
+        for target_url in candidates:
+            try:
+                resp = await client.get(target_url)
+                if resp.status_code != 200:
+                    continue
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                # ① mailto: リンクを最優先
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if href.startswith("mailto:"):
+                        email = href.replace("mailto:", "").split("?")[0].strip()
+                        if email and "@" in email and not email.endswith(INVALID_EMAIL_EXTS):
+                            logger.info(f"メール取得(mailto): {email} from {target_url}")
+                            return email
+
+                # ② テキストからメール正規表現
+                text = soup.get_text(" ", strip=True)
+                emails = EMAIL_REGEX.findall(text)
+                filtered = [
+                    e for e in emails
+                    if not e.endswith(INVALID_EMAIL_EXTS)
+                ]
+                if filtered:
+                    logger.info(f"メール取得(regex): {filtered[0]} from {target_url}")
+                    return filtered[0]
+
+                # ③ フォームURLを記憶（まだ見つかっていない場合のみ）
+                if not form_url_found:
+                    # <form> タグがあるページはそのURLをフォームとして記録
+                    if soup.find("form"):
+                        form_url_found = str(resp.url)
+                        logger.info(f"フォームURL候補: {form_url_found}")
+
+                    # 「お問い合わせ」リンクを探してフォームURLとして記録
+                    if not form_url_found:
+                        for a in soup.find_all("a", href=True):
+                            link_text = a.get_text(strip=True)
+                            if any(kw in link_text for kw in CONTACT_KEYWORDS):
+                                href = a["href"]
+                                if href.startswith("http"):
+                                    form_url_found = href
+                                elif href.startswith("/"):
+                                    form_url_found = base + href
+                                if form_url_found:
+                                    logger.info(f"フォームURL候補(リンク): {form_url_found}")
+                                    break
+
+            except Exception as e:
+                logger.debug(f"スクレイピングスキップ ({target_url}): {e}")
+                continue
+
+    # メールが取れなかった場合はフォームURLを返す
+    return form_url_found
 
 # ============================================================
 # ヘルスチェック
@@ -207,7 +288,7 @@ def health():
         raise HTTPException(status_code=503, detail=f"DB接続失敗: {str(e)}")
 
 # ============================================================
-# daily-status デバッグ用エンドポイント追加
+# daily-status
 # ============================================================
 @app.get("/places/daily-status")
 def daily_status():
@@ -304,13 +385,13 @@ async def search_places(
     return PlacesSearchResponse(places=results, next_page_token=next_token)
 
 # ============================================================
-# Places 検索結果をDBに保存
+# Places 検索結果をDBに保存（スクレイピング付き）
 # ============================================================
 class SavePlacesRequest(BaseModel):
     places: List[dict]
 
 @app.post("/places/save", status_code=201)
-def save_places(req: SavePlacesRequest):
+async def save_places(req: SavePlacesRequest):  # async に変更
     today_count = get_today_count()
     remaining = DAILY_LIMIT - today_count
 
@@ -331,12 +412,22 @@ def save_places(req: SavePlacesRequest):
             skipped_dup.append(item.get("name", ""))
             continue
 
+        url = item.get("url", "").strip()
+
+        # URLがあればメール or フォームURLをスクレイピング
+        email = ""
+        if url:
+            try:
+                email = await scrape_contact_from_url(url)
+            except Exception as e:
+                logger.warning(f"スクレイピング失敗 ({url}): {e}")
+
         payload = {
             "name": item.get("name", "").strip(),
             "area": item.get("area", "").strip(),
-            "email": "",
+            "email": email,          # メール or フォームURL or ""
             "phone": item.get("phone", "").strip(),
-            "url": item.get("url", "").strip(),
+            "url": url,
             "status": "未送信",
             "place_id": place_id,
         }
@@ -348,6 +439,9 @@ def save_places(req: SavePlacesRequest):
             res = supabase.table("companies").insert(payload).execute()
             if res.data:
                 saved.append(res.data[0])
+                logger.info(
+                    f"保存: {payload['name']} / email={email or '(なし)'}"
+                )
         except Exception as e:
             logger.error(f"INSERT エラー ({payload['name']}): {e}")
             skipped_dup.append(payload["name"])
@@ -357,7 +451,10 @@ def save_places(req: SavePlacesRequest):
     else:
         today_new = today_count
 
-    logger.info(f"保存完了: {len(saved)}件 / 重複: {len(skipped_dup)}件 / 上限超過: {len(skipped_limit)}件 / 本日合計: {today_new}")
+    logger.info(
+        f"保存完了: {len(saved)}件 / 重複: {len(skipped_dup)}件 / "
+        f"上限超過: {len(skipped_limit)}件 / 本日合計: {today_new}"
+    )
 
     return {
         "ok": True,
@@ -373,7 +470,6 @@ def save_places(req: SavePlacesRequest):
 # エリア抽出ヘルパー
 # ============================================================
 def _extract_area(address: str, fallback: str) -> str:
-    import re
     pref_pattern = r'(北海道|(?:東京|大阪|京都)府|.{2,3}県)'
     city_pattern = r'(?:札幌市|(?:.+?)[市区町村])'
     pref_match = re.search(pref_pattern, address)
@@ -405,7 +501,6 @@ def get_companies(
             query = query.or_(f"name.ilike.%{keyword}%,email.ilike.%{keyword}%,phone.ilike.%{keyword}%")
         if status:
             query = query.eq("status", status)
-        # id昇順（小さい番号＝古い順が先頭）
         query = query.order("id", desc=False)
         res = query.range(offset, offset + limit - 1).execute()
         return {"data": res.data, "total": res.count, "limit": limit, "offset": offset}
