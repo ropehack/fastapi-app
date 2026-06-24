@@ -3,3 +3,4 @@ uvicorn
 supabase
 python-dotenv
 httpx
+beautifulsoup4>=4.12.0
